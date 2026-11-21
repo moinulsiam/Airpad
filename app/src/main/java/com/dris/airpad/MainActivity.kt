@@ -1,16 +1,11 @@
 package com.dris.airpad
 
-import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
-import android.bluetooth.BluetoothAdapter
 import android.content.Context
-import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -32,7 +27,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 
-@SuppressLint("MissingPermission", "ClickableViewAccessibility")
+@SuppressLint("ClickableViewAccessibility")
 class MainActivity : Activity() {
 
     private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
@@ -40,7 +35,7 @@ class MainActivity : Activity() {
     private val NORMAL = 0xFF37474F.toInt()
     private val ACTIVE = 0xFF1565C0.toInt()
 
-    private lateinit var hid: HidManager
+    private lateinit var link: WifiLink
     private lateinit var ir: IrRemote
     private val ui = Handler(Looper.getMainLooper())
 
@@ -55,12 +50,11 @@ class MainActivity : Activity() {
     private val modBtns = HashMap<Int, Button>()
     private var prev = ""
     private var suppress = false
-    private var started = false
 
     private val ticker = object : Runnable {
         override fun run() {
-            if (started) hid.tick()
-            ui.postDelayed(this, 3000)
+            link.tick()
+            ui.postDelayed(this, 2000)
         }
     }
 
@@ -68,7 +62,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        hid = HidManager(this) { text, ok ->
+        link = WifiLink(this) { text, ok ->
             ui.post {
                 status.text = text
                 status.background = round(if (ok) 0xFF2E7D32.toInt() else 0xFFB71C1C.toInt())
@@ -76,33 +70,15 @@ class MainActivity : Activity() {
         }
         ir = IrRemote(this)
         buildUi()
-        if (hasPerms()) startHid() else requestPermissions(perms(), 1)
-    }
-
-    override fun onRequestPermissionsResult(code: Int, p: Array<out String>, r: IntArray) {
-        super.onRequestPermissionsResult(code, p, r)
-        if (hasPerms()) startHid() else status.text = "Bluetooth permission needed"
+        link.start()
+        ui.postDelayed(ticker, 800)
+        if (link.pin.isEmpty()) ui.post { settings() }
     }
 
     override fun onDestroy() {
         ui.removeCallbacks(ticker)
-        hid.stop()
+        link.stop()
         super.onDestroy()
-    }
-
-    private fun perms(): Array<String> =
-        if (Build.VERSION.SDK_INT >= 31)
-            arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
-        else arrayOf<String>()
-
-    private fun hasPerms(): Boolean =
-        perms().all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
-
-    private fun startHid() {
-        started = true
-        hid.tick()
-        ui.removeCallbacks(ticker)
-        ui.postDelayed(ticker, 2000)
     }
 
     // ------------------------------------------------------------ helpers
@@ -151,13 +127,8 @@ class MainActivity : Activity() {
         root.addView(status, LinearLayout.LayoutParams(MATCH, WRAP))
 
         root.addView(rowOf(
-            btn("Pair (make visible)") {
-                startActivity(
-                    Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
-                        .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)
-                )
-            },
-            btn("Select PC") { choosePc() }
+            btn("PIN / IP") { settings() },
+            btn("Find PC") { link.findPc() }
         ))
         root.addView(rowOf(
             btn("Touchpad") { show(0) },
@@ -188,23 +159,36 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun choosePc() {
-        val list = hid.bondedList()
-        if (list.isEmpty()) {
-            status.text = "No paired device. Pair from the PC first."
-            return
+    private fun settings() {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(10), dp(20), 0)
         }
-        val names = list.map { it.name ?: it.address }.toTypedArray()
+        val pinE = EditText(this).apply {
+            hint = "PIN (shown on the PC window)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(link.pin)
+        }
+        val ipE = EditText(this).apply {
+            hint = "PC IP (leave empty = auto find)"
+            setText(link.host)
+        }
+        box.addView(pinE)
+        box.addView(ipE)
         AlertDialog.Builder(this)
-            .setTitle("Choose PC")
-            .setItems(names) { _, i -> hid.connectTo(list[i]) }
+            .setTitle("PC connection")
+            .setView(box)
+            .setPositiveButton("Save") { _, _ ->
+                link.setConfig(pinE.text.toString(), ipE.text.toString())
+            }
+            .setNegativeButton("Cancel", null)
             .show()
     }
 
     // ------------------------------------------------------------ touchpad tab
     private fun buildPad(): View {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        col.addView(TouchPad(this, hid), LinearLayout.LayoutParams(MATCH, 0, 1f).apply {
+        col.addView(TouchPad(this, link), LinearLayout.LayoutParams(MATCH, 0, 1f).apply {
             setMargins(dp(3), dp(3), dp(3), dp(3))
         })
         val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -218,11 +202,11 @@ class MainActivity : Activity() {
                 setOnTouchListener { v, e ->
                     when (e.actionMasked) {
                         MotionEvent.ACTION_DOWN -> {
-                            hid.mouseButton(mask, true)
+                            link.mouseButton(mask, true)
                             v.alpha = 0.6f
                         }
                         MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                            hid.mouseButton(mask, false)
+                            link.mouseButton(mask, false)
                             v.alpha = 1f
                         }
                     }
@@ -243,18 +227,30 @@ class MainActivity : Activity() {
         for (b in modBtns.values) b.background = round(NORMAL)
     }
 
-    private fun press(usage: Int, extra: Int = 0) {
-        hid.key(modMask or extra, usage)
+    /** vk = Windows virtual-key code */
+    private fun press(vk: Int, extra: Int = 0) {
+        link.key(vk, modMask or extra)
         clearMods()
     }
 
-    private fun typeChar(c: Char) {
-        val e = Keys.map[c] ?: return
-        hid.key(modMask or (if (e.second) 2 else 0), e.first)
-        clearMods()
+    private fun sendTyped(s: String) {
+        val sb = StringBuilder()
+        for (c in s) {
+            if (modMask != 0 && c.code < 128 && c.isLetterOrDigit()) {
+                if (sb.isNotEmpty()) {
+                    link.text(sb.toString())
+                    sb.setLength(0)
+                }
+                link.key(c.uppercaseChar().code, modMask)
+                clearMods()
+            } else {
+                sb.append(c)
+            }
+        }
+        if (sb.isNotEmpty()) link.text(sb.toString())
     }
 
-    private fun k(label: String, usage: Int, mod: Int = 0): Button = btn(label) { press(usage, mod) }
+    private fun k(label: String, vk: Int, mod: Int = 0): Button = btn(label) { press(vk, mod) }
 
     private fun modBtn(label: String, bit: Int): Button {
         val b = btn(label) {}
@@ -271,12 +267,10 @@ class MainActivity : Activity() {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         edit = EditText(this).apply {
-            hint = "Tap here and type (English)"
+            hint = "Tap here and type"
             setTextColor(Color.WHITE)
             setHintTextColor(0xFF90A4AE.toInt())
-            inputType = InputType.TYPE_CLASS_TEXT or
-                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
-                InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
             imeOptions = EditorInfo.IME_ACTION_NONE
             addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
@@ -287,8 +281,8 @@ class MainActivity : Activity() {
                     var p = 0
                     val m = minOf(prev.length, now.length)
                     while (p < m && prev[p] == now[p]) p++
-                    repeat(prev.length - p) { press(0x2A) }
-                    for (i in p until now.length) typeChar(now[i])
+                    repeat(prev.length - p) { press(0x08) }
+                    sendTyped(now.substring(p))
                     prev = now
                     if (now.length > 60) {
                         suppress = true
@@ -298,13 +292,13 @@ class MainActivity : Activity() {
                     }
                 }
             })
-            setOnEditorActionListener { _, _, _ -> press(0x28); true }
+            setOnEditorActionListener { _, _, _ -> press(0x0D); true }
             setOnKeyListener { _, code, ev ->
                 if (ev.action == KeyEvent.ACTION_DOWN) {
                     if (code == KeyEvent.KEYCODE_DEL && text.isEmpty()) {
-                        press(0x2A); true
+                        press(0x08); true
                     } else if (code == KeyEvent.KEYCODE_ENTER) {
-                        press(0x28); true
+                        press(0x0D); true
                     } else false
                 } else false
             }
@@ -313,13 +307,14 @@ class MainActivity : Activity() {
             setMargins(dp(3), dp(3), dp(3), dp(3))
         })
 
-        col.addView(rowOf(k("Esc", 0x29), k("Tab", 0x2B), k("Enter", 0x28), k("Bksp", 0x2A)))
+        col.addView(rowOf(k("Esc", 0x1B), k("Tab", 0x09), k("Enter", 0x0D), k("Bksp", 0x08)))
         col.addView(rowOf(modBtn("Ctrl", 1), modBtn("Alt", 4), modBtn("Shift", 2), modBtn("Win", 8)))
-        col.addView(rowOf(k("Home", 0x4A), k("End", 0x4D), k("PgUp", 0x4B), k("PgDn", 0x4E)))
-        col.addView(rowOf(k("←", 0x50), k("↑", 0x52), k("↓", 0x51), k("→", 0x4F)))
-        col.addView(rowOf(k("Del", 0x4C), k("Space", 0x2C), btn("Start") { hid.key(8, 0) }, k("Alt+Tab", 0x2B, 4)))
-        col.addView(rowOf(k("Copy", 0x06, 1), k("Paste", 0x19, 1), k("Cut", 0x1B, 1), k("All", 0x04, 1)))
-        col.addView(rowOf(k("Undo", 0x1D, 1), k("Save", 0x16, 1), k("F5", 0x3E), k("Alt+F4", 0x3D, 4)))
+        col.addView(rowOf(k("Home", 0x24), k("End", 0x23), k("PgUp", 0x21), k("PgDn", 0x22)))
+        col.addView(rowOf(k("←", 0x25), k("↑", 0x26), k("↓", 0x28), k("→", 0x27)))
+        col.addView(rowOf(k("Del", 0x2E), k("Space", 0x20), btn("Start") { link.key(0x5B, 0) }, k("Alt+Tab", 0x09, 4)))
+        col.addView(rowOf(k("Copy", 0x43, 1), k("Paste", 0x56, 1), k("Cut", 0x58, 1), k("All", 0x41, 1)))
+        col.addView(rowOf(k("Undo", 0x5A, 1), k("Save", 0x53, 1), k("F5", 0x74), k("Alt+F4", 0x73, 4)))
+        col.addView(rowOf(k("Vol −", 0xAE), k("Vol +", 0xAF), k("Mute", 0xAD), k("Play", 0xB3)))
 
         sv.addView(col, ViewGroup.LayoutParams(MATCH, WRAP))
         return sv

@@ -15,7 +15,7 @@ import kotlin.math.abs
  *  - 2 finger drag  : scroll
  */
 @SuppressLint("ViewConstructor", "ClickableViewAccessibility")
-class TouchPad(ctx: Context, private val hid: HidManager) : View(ctx) {
+class TouchPad(ctx: Context, private val hid: WifiLink) : View(ctx) {
 
     private var lastX = 0f
     private var lastY = 0f
