@@ -24,7 +24,7 @@ class TouchPad(ctx: Context, private val hid: WifiLink) : View(ctx) {
     private var maxPtr = 0
     private var scrollAcc = 0f
 
-    private val speed = 2.0f
+    var speed = 1.3f
 
     init {
         background = GradientDrawable().apply {

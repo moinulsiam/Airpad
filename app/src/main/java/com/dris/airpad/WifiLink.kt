@@ -23,6 +23,7 @@ class WifiLink(private val ctx: Context, private val onState: (String, Boolean) 
     @Volatile var host: String = prefs.getString("host", "") ?: ""
     @Volatile var pin: String = prefs.getString("pin", "") ?: ""
     @Volatile private var lastOk = 0L
+    @Volatile var onPending: (() -> Unit)? = null
     @Volatile private var badPin = false
 
     private var accX = 0f
@@ -75,9 +76,13 @@ class WifiLink(private val ctx: Context, private val onState: (String, Boolean) 
                 s.receive(p)
                 val msg = String(p.data, 0, p.length)
                 when {
-                    msg == "OK" -> {
+                    msg == "OK" || msg.startsWith("OK|") -> {
                         lastOk = System.currentTimeMillis()
                         badPin = false
+                        if (msg.length > 3) {
+                            val n = msg.substring(3).toIntOrNull() ?: 0
+                            if (n > 0) onPending?.invoke()
+                        }
                     }
                     msg == "BADPIN" -> badPin = true
                     msg.startsWith("AIRPAD!") -> {
@@ -197,5 +202,7 @@ class WifiLink(private val ctx: Context, private val onState: (String, Boolean) 
     /** Windows virtual-key code + modifiers (1=Ctrl 2=Shift 4=Alt 8=Win) */
     fun key(vk: Int, mods: Int) = cmd("K", "$vk,$mods")
 
-    fun text(s: String) = cmd("T", s)
+    fun text(s: String) {
+        for (part in s.chunked(150)) cmd("T", part)
+    }
 }

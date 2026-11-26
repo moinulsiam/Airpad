@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
@@ -25,6 +27,8 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
+import android.widget.Toast
 import android.widget.TextView
 
 @SuppressLint("ClickableViewAccessibility")
@@ -44,12 +48,18 @@ class MainActivity : Activity() {
     private lateinit var tabPad: View
     private lateinit var tabKeys: View
     private lateinit var tabTv: View
+    private lateinit var tabFiles: View
+    private lateinit var fileStatus: TextView
+    private lateinit var fileLog: TextView
+    private lateinit var transfer: FileTransfer
+    private val logBuf = ArrayList<String>()
     private lateinit var edit: EditText
 
     private var modMask = 0
     private val modBtns = HashMap<Int, Button>()
     private var prev = ""
     private var suppress = false
+    private var live = true
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -68,9 +78,20 @@ class MainActivity : Activity() {
                 status.background = round(if (ok) 0xFF2E7D32.toInt() else 0xFFB71C1C.toInt())
             }
         }
+        transfer = FileTransfer(this, link) { msg, progress ->
+            ui.post {
+                if (progress) {
+                    fileStatus.text = msg
+                } else {
+                    addLog(msg)
+                }
+            }
+        }
+        link.onPending = { transfer.pull() }
         ir = IrRemote(this)
         buildUi()
         link.start()
+        handleShare(intent)
         ui.postDelayed(ticker, 800)
         if (link.pin.isEmpty()) ui.post { settings() }
     }
@@ -133,7 +154,8 @@ class MainActivity : Activity() {
         root.addView(rowOf(
             btn("Touchpad") { show(0) },
             btn("Keyboard") { show(1) },
-            btn("TV Remote") { show(2) }
+            btn("TV") { show(2) },
+            btn("Files") { show(3) }
         ))
 
         content = FrameLayout(this)
@@ -142,9 +164,11 @@ class MainActivity : Activity() {
         tabPad = buildPad()
         tabKeys = buildKeys()
         tabTv = buildTv()
+        tabFiles = buildFiles()
         content.addView(tabPad, FrameLayout.LayoutParams(MATCH, MATCH))
         content.addView(tabKeys, FrameLayout.LayoutParams(MATCH, MATCH))
         content.addView(tabTv, FrameLayout.LayoutParams(MATCH, MATCH))
+        content.addView(tabFiles, FrameLayout.LayoutParams(MATCH, MATCH))
         show(0)
         setContentView(root)
     }
@@ -153,6 +177,7 @@ class MainActivity : Activity() {
         tabPad.visibility = if (i == 0) View.VISIBLE else View.GONE
         tabKeys.visibility = if (i == 1) View.VISIBLE else View.GONE
         tabTv.visibility = if (i == 2) View.VISIBLE else View.GONE
+        tabFiles.visibility = if (i == 3) View.VISIBLE else View.GONE
         if (i != 1) {
             val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
             imm.hideSoftInputFromWindow(content.windowToken, 0)
@@ -186,9 +211,45 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------ touchpad tab
+    private fun fmt(v: Float) = String.format(java.util.Locale.US, "%.1f", v)
+
     private fun buildPad(): View {
+        val prefs = getSharedPreferences("airpad", Context.MODE_PRIVATE)
+        val pad = TouchPad(this, link)
+        pad.speed = prefs.getFloat("speed", 1.3f)
+
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        col.addView(TouchPad(this, link), LinearLayout.LayoutParams(MATCH, 0, 1f).apply {
+
+        val speedLbl = TextView(this).apply {
+            text = "Speed " + fmt(pad.speed)
+            setTextColor(Color.WHITE)
+            setPadding(dp(6), 0, dp(10), 0)
+        }
+        val bar = SeekBar(this).apply {
+            max = 40
+            progress = (pad.speed * 10).toInt().coerceIn(3, 40)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    pad.speed = maxOf(3, p) / 10f
+                    speedLbl.text = "Speed " + fmt(pad.speed)
+                }
+
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+
+                override fun onStopTrackingTouch(sb: SeekBar?) {
+                    prefs.edit().putFloat("speed", pad.speed).apply()
+                }
+            })
+        }
+        val speedRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(speedLbl, LinearLayout.LayoutParams(WRAP, WRAP))
+            addView(bar, LinearLayout.LayoutParams(0, WRAP, 1f))
+        }
+        col.addView(speedRow, LinearLayout.LayoutParams(MATCH, WRAP))
+
+        col.addView(pad, LinearLayout.LayoutParams(MATCH, 0, 1f).apply {
             setMargins(dp(3), dp(3), dp(3), dp(3))
         })
         val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -250,6 +311,25 @@ class MainActivity : Activity() {
         if (sb.isNotEmpty()) link.text(sb.toString())
     }
 
+    private fun clearField() {
+        suppress = true
+        edit.setText("")
+        prev = ""
+        suppress = false
+    }
+
+    private fun doSend() {
+        if (live) {
+            Toast.makeText(this, "Turn Live typing OFF to use Send", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val t = edit.text.toString()
+        if (t.isNotEmpty()) {
+            sendTyped(t)
+            clearField()
+        }
+    }
+
     private fun k(label: String, vk: Int, mod: Int = 0): Button = btn(label) { press(vk, mod) }
 
     private fun modBtn(label: String, bit: Int): Button {
@@ -267,10 +347,15 @@ class MainActivity : Activity() {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         edit = EditText(this).apply {
-            hint = "Tap here and type"
+            hint = "Tap here and type (voice typing: turn Live OFF, then Send)"
             setTextColor(Color.WHITE)
             setHintTextColor(0xFF90A4AE.toInt())
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            minLines = 3
+            maxLines = 6
+            gravity = Gravity.TOP or Gravity.START
+            inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
+                InputType.TYPE_TEXT_FLAG_MULTI_LINE
             imeOptions = EditorInfo.IME_ACTION_NONE
             addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
@@ -278,23 +363,27 @@ class MainActivity : Activity() {
                 override fun afterTextChanged(s: Editable?) {
                     if (suppress) return
                     val now = s?.toString() ?: ""
+                    if (!live) {
+                        prev = now
+                        return
+                    }
                     var p = 0
                     val m = minOf(prev.length, now.length)
                     while (p < m && prev[p] == now[p]) p++
                     repeat(prev.length - p) { press(0x08) }
                     sendTyped(now.substring(p))
                     prev = now
-                    if (now.length > 60) {
-                        suppress = true
-                        setText("")
-                        prev = ""
-                        suppress = false
-                    }
+                    if (now.length > 400) clearField()
                 }
             })
-            setOnEditorActionListener { _, _, _ -> press(0x0D); true }
+            setOnEditorActionListener { _, _, _ ->
+                if (live) {
+                    press(0x0D)
+                    true
+                } else false
+            }
             setOnKeyListener { _, code, ev ->
-                if (ev.action == KeyEvent.ACTION_DOWN) {
+                if (live && ev.action == KeyEvent.ACTION_DOWN) {
                     if (code == KeyEvent.KEYCODE_DEL && text.isEmpty()) {
                         press(0x08); true
                     } else if (code == KeyEvent.KEYCODE_ENTER) {
@@ -307,6 +396,14 @@ class MainActivity : Activity() {
             setMargins(dp(3), dp(3), dp(3), dp(3))
         })
 
+        val liveBtn = btn("Live: ON") {}
+        liveBtn.setOnClickListener {
+            live = !live
+            liveBtn.text = if (live) "Live: ON" else "Live: OFF"
+            clearField()
+        }
+        col.addView(rowOf(liveBtn, btn("Send ▶") { doSend() }, btn("Clear") { clearField() }))
+
         col.addView(rowOf(k("Esc", 0x1B), k("Tab", 0x09), k("Enter", 0x0D), k("Bksp", 0x08)))
         col.addView(rowOf(modBtn("Ctrl", 1), modBtn("Alt", 4), modBtn("Shift", 2), modBtn("Win", 8)))
         col.addView(rowOf(k("Home", 0x24), k("End", 0x23), k("PgUp", 0x21), k("PgDn", 0x22)))
@@ -318,6 +415,91 @@ class MainActivity : Activity() {
 
         sv.addView(col, ViewGroup.LayoutParams(MATCH, WRAP))
         return sv
+    }
+
+    // ------------------------------------------------------------ files tab
+    private fun buildFiles(): View {
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(3), dp(3), dp(3), dp(3))
+        }
+        col.addView(rowOf(
+            btn("Send files to PC") { pickFiles() },
+            btn("Get files from PC") { transfer.pull() }
+        ))
+        col.addView(TextView(this).apply {
+            text = "Phone → PC: tap 'Send files to PC' (or use Share → AirPad in any app). " +
+                "Saved on the PC in Downloads\\AirPad.\n" +
+                "PC → phone: press 'Send file to phone' in the PC server window. " +
+                "Files arrive automatically and are saved in Downloads/AirPad on the phone."
+            setTextColor(0xFF90A4AE.toInt())
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+        })
+        fileStatus = TextView(this).apply {
+            setTextColor(0xFFFFAB00.toInt())
+            setPadding(dp(6), dp(4), dp(6), dp(4))
+        }
+        col.addView(fileStatus)
+        fileLog = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+        }
+        val sv = ScrollView(this)
+        sv.addView(fileLog)
+        col.addView(sv, LinearLayout.LayoutParams(MATCH, 0, 1f))
+        return col
+    }
+
+    private fun addLog(m: String) {
+        logBuf.add(0, m)
+        if (logBuf.size > 30) logBuf.removeAt(logBuf.size - 1)
+        fileLog.text = logBuf.joinToString("\n")
+    }
+
+    private fun pickFiles() {
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        i.addCategory(Intent.CATEGORY_OPENABLE)
+        i.type = "*/*"
+        i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        startActivityForResult(i, 77)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 77 && resultCode == RESULT_OK && data != null) {
+            val uris = ArrayList<Uri>()
+            val cd = data.clipData
+            if (cd != null) {
+                for (i in 0 until cd.itemCount) uris.add(cd.getItemAt(i).uri)
+            } else {
+                val u = data.data
+                if (u != null) uris.add(u)
+            }
+            if (uris.isNotEmpty()) transfer.sendUris(uris)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        handleShare(intent)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun handleShare(i: Intent?) {
+        if (i == null) return
+        val uris = ArrayList<Uri>()
+        if (i.action == Intent.ACTION_SEND) {
+            val u = i.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+            if (u != null) uris.add(u)
+        } else if (i.action == Intent.ACTION_SEND_MULTIPLE) {
+            val l = i.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
+            if (l != null) uris.addAll(l)
+        }
+        if (uris.isNotEmpty()) {
+            i.action = null
+            show(3)
+            transfer.sendUris(uris)
+        }
     }
 
     // ------------------------------------------------------------ TV remote tab (LG, IR)

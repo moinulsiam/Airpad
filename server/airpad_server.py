@@ -7,8 +7,13 @@ import socket
 import threading
 import time
 import tkinter as tk
+from tkinter import filedialog
 
 PORT = 50505
+FILE_PORT = 50506
+RECV_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "AirPad")
+QUEUE = []          # files waiting to be sent to the phone
+QUEUE_LOCK = threading.Lock()
 ULONG_PTR = ctypes.c_size_t
 user32 = ctypes.windll.user32
 
@@ -96,7 +101,7 @@ def type_text(s):
 
 
 # ------------------------------------------------------------------ state / pin
-STATE = {"pin": "", "last": None, "error": ""}
+STATE = {"pin": "", "last": None, "error": "", "log": []}
 PIN_FILE = os.path.join(os.environ.get("APPDATA", "."), "AirPad", "pin.txt")
 
 
@@ -155,7 +160,8 @@ def handle(data, addr, sock):
     STATE["last"] = (addr[0], time.time())
     try:
         if cmd == "P":
-            sock.sendto(b"OK", addr)
+            n = len(QUEUE)
+            sock.sendto(b"OK" if n == 0 else ("OK|%d" % n).encode(), addr)
         elif cmd == "M":
             dx, dy = (int(v) for v in arg.split(","))
             _send(_mouse(0x0001, dx, dy))
@@ -195,14 +201,124 @@ def serve():
         handle(data, addr, sock)
 
 
+# ------------------------------------------------------------------ file transfer (TCP)
+def log(msg):
+    STATE["log"].append(msg)
+    del STATE["log"][:-5]
+
+
+def read_line(conn, limit=4096):
+    buf = b""
+    while len(buf) < limit:
+        c = conn.recv(1)
+        if not c or c == b"\n":
+            break
+        buf += c
+    return buf.decode("utf-8", "ignore").strip()
+
+
+def safe_name(name):
+    name = os.path.basename(name.replace("\\", "/"))
+    for ch in '<>:"/\\|?*':
+        name = name.replace(ch, "_")
+    return name.strip() or "file"
+
+
+def unique_path(folder, name):
+    os.makedirs(folder, exist_ok=True)
+    base, ext = os.path.splitext(name)
+    path = os.path.join(folder, name)
+    i = 1
+    while os.path.exists(path):
+        path = os.path.join(folder, "%s (%d)%s" % (base, i, ext))
+        i += 1
+    return path
+
+
+def handle_conn(conn):
+    path = None
+    done = False
+    try:
+        conn.settimeout(30)
+        parts = read_line(conn).split("|", 3)
+        if len(parts) < 2 or parts[1] != STATE["pin"]:
+            conn.sendall(b"ERR\n")
+            return
+        kind = parts[0]
+        if kind == "U" and len(parts) == 4:
+            size = int(parts[2])
+            path = unique_path(RECV_DIR, safe_name(parts[3]))
+            remaining = size
+            with open(path, "wb") as f:
+                while remaining > 0:
+                    chunk = conn.recv(min(65536, remaining))
+                    if not chunk:
+                        raise IOError("connection closed")
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            done = True
+            conn.sendall(b"OK\n")
+            log("Received: " + os.path.basename(path))
+        elif kind == "G":
+            with QUEUE_LOCK:
+                item = QUEUE[0] if QUEUE else None
+            if item is None or not os.path.exists(item):
+                if item is not None:
+                    with QUEUE_LOCK:
+                        QUEUE.remove(item)
+                conn.sendall(b"N\n")
+                return
+            size = os.path.getsize(item)
+            name = os.path.basename(item).replace("\n", " ")
+            conn.sendall(("F|%d|%s\n" % (size, name)).encode("utf-8"))
+            with open(item, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    conn.sendall(chunk)
+            if read_line(conn) == "A":
+                with QUEUE_LOCK:
+                    if item in QUEUE:
+                        QUEUE.remove(item)
+                log("Sent to phone: " + name)
+    except Exception:
+        pass
+    finally:
+        if path and not done:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        conn.close()
+
+
+def file_server():
+    try:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", FILE_PORT))
+        srv.listen(5)
+    except OSError as e:
+        STATE["error"] = "File port %d busy: %s" % (FILE_PORT, e)
+        return
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            continue
+        threading.Thread(target=handle_conn, args=(conn,), daemon=True).start()
+
+
 # ------------------------------------------------------------------ window
 def main():
     load_pin()
     threading.Thread(target=serve, daemon=True).start()
+    threading.Thread(target=file_server, daemon=True).start()
 
     root = tk.Tk()
     root.title("AirPad Server")
-    root.geometry("360x240")
+    root.geometry("380x420")
     root.resizable(False, False)
 
     tk.Label(root, text="AirPad Server", font=("Segoe UI", 16, "bold")).pack(pady=(12, 2))
@@ -218,7 +334,24 @@ def main():
     def change_pin():
         new_pin()
 
-    tk.Button(root, text="New PIN", command=change_pin).pack(pady=8)
+    tk.Button(root, text="New PIN", command=change_pin).pack(pady=4)
+
+    def send_to_phone():
+        files = filedialog.askopenfilenames(title="Choose files to send to the phone")
+        with QUEUE_LOCK:
+            QUEUE.extend(files)
+
+    def open_folder():
+        os.makedirs(RECV_DIR, exist_ok=True)
+        os.startfile(RECV_DIR)
+
+    tk.Button(root, text="Send file to phone", command=send_to_phone,
+              font=("Segoe UI", 11, "bold")).pack(pady=4, ipadx=10)
+    tk.Button(root, text="Open received files folder", command=open_folder).pack(pady=2)
+    q_lbl = tk.Label(root, font=("Segoe UI", 10))
+    q_lbl.pack(pady=(8, 0))
+    log_lbl = tk.Label(root, font=("Segoe UI", 9), fg="#555", justify="left")
+    log_lbl.pack()
 
     def refresh():
         ip_lbl.config(text="PC IP: " + local_ip())
@@ -230,6 +363,8 @@ def main():
             st_lbl.config(text="Phone connected (" + last[0] + ")", fg="#2E7D32")
         else:
             st_lbl.config(text="Waiting for phone...", fg="#555")
+        q_lbl.config(text="Waiting to send to phone: %d file(s)" % len(QUEUE))
+        log_lbl.config(text="\n".join(STATE["log"][-4:]))
         root.after(1000, refresh)
 
     refresh()
